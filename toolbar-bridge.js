@@ -17,8 +17,10 @@
   const syncVersion = () => {
     const ui = getUi();
     if (!ui?.version) return false;
-    const version = chrome.runtime.getManifest().version;
-    ui.version.textContent = `v${version.replace(/\.0$/, '')}`;
+    const manifest = chrome.runtime.getManifest();
+    const version = manifest.version_name || manifest.version.replace(/\.0$/, '');
+    ui.version.textContent = `v${version}`;
+    ui.version.title = `Library Cleaner v${version}`;
     return true;
   };
 

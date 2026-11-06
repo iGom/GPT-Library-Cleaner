@@ -1,9 +1,12 @@
 (() => {
   const CHANNEL = 'LC_BRIDGE_V240';
-  const VERSION = '2.11.0';
+  const VERSION = '2.12.0-test.1';
   const STORAGE_UI = 'lc_ui_v190';
   const ROW_HEIGHT = 58;
   const OVERSCAN = 8;
+  const GRID_HEIGHT = 244;
+  const GRID_GAP = 12;
+  const GRID_MIN_WIDTH = 180;
   const PREVIEW_CONCURRENCY = 4;
   const systemThemeQuery = matchMedia('(prefers-color-scheme: dark)');
 
@@ -14,6 +17,9 @@
     librarySource: null,
     accountKey: '',
     files: new Map(),
+    folders: new Map(),
+    folderOptions: { scope: 'all', ignoreFolderFiles: false, ignoredFolderIds: [], includeSubfolders: true },
+    viewMode: 'list',
     selected: new Set(),
     query: '',
     typeFilter: 'all',
@@ -57,6 +63,7 @@
 
   const ui = {};
   const I18N = globalThis.LibraryCleanerI18n;
+  const Folders = globalThis.LibraryCleanerFolders;
   const currentLocale = () => I18N.resolveLocale(state.language);
   const currentFormatLocale = () => I18N.formatLocale(currentLocale());
   const t = (key, vars = {}) => I18N.t(currentLocale(), key, vars);
@@ -76,10 +83,13 @@
   };
 
   const injectBridge = () => {
-    const script = document.createElement('script');
-    script.src = chrome.runtime.getURL('page-hook.js');
-    script.onload = () => script.remove();
-    (document.documentElement || document.head).appendChild(script);
+    const inject = (name, next) => {
+      const script = document.createElement('script');
+      script.src = chrome.runtime.getURL(name);
+      script.onload = () => { script.remove(); next?.(); };
+      (document.documentElement || document.head).appendChild(script);
+    };
+    inject('folder-model.js', () => inject('page-hook.js'));
   };
   injectBridge();
 
@@ -152,6 +162,8 @@
 
   const accountKeys = () => state.accountKey ? {
     files: `lc_files_${state.accountKey}`,
+    folders: `lc_folders_${state.accountKey}`,
+    folderOptions: `lc_folder_options_${state.accountKey}`,
     sync: `lc_sync_${state.accountKey}`,
     checkpoint: `lc_checkpoint_${state.accountKey}`
   } : null;
@@ -164,6 +176,7 @@
   const saveUi = () => chrome.storage.local.set({
     [STORAGE_UI]: {
       theme: state.theme,
+      viewMode: state.viewMode,
       language: state.language,
       typeFilter: state.typeFilter,
       cleanTypeFilter: state.cleanTypeFilter,
@@ -182,7 +195,7 @@
     const keys = accountKeys();
     if (!state.accountReady || !keys) return;
     const files = [...state.files.values()].filter(isValidFile);
-    await chrome.storage.local.set({ [keys.files]: files, [keys.sync]: state.lastSyncAt, [keys.checkpoint]: state.syncCheckpoint });
+    await chrome.storage.local.set({ [keys.files]: files, [keys.folders]: [...state.folders.values()], [keys.sync]: state.lastSyncAt, [keys.checkpoint]: state.syncCheckpoint });
   };
 
   const scheduleIndexSave = (delay = 1600) => {
@@ -197,6 +210,7 @@
     const data = await chrome.storage.local.get([STORAGE_UI, 'lc_ui_v160', 'lc_ui_v120', 'cglc_ui_v120']);
     const settings = data[STORAGE_UI] || data.lc_ui_v160 || data.lc_ui_v120 || data.cglc_ui_v120 || {};
     if (['auto','light','dark'].includes(settings.theme)) state.theme = settings.theme;
+    if (['list', 'grid'].includes(settings.viewMode)) state.viewMode = settings.viewMode;
     if (I18N.supported.includes(settings.language)) state.language = settings.language;
     if (Object.keys(typeSets).concat('all','other').includes(settings.typeFilter)) state.typeFilter = settings.typeFilter;
     if (Object.keys(typeSets).concat('all','other').includes(settings.cleanTypeFilter)) state.cleanTypeFilter = settings.cleanTypeFilter;
@@ -215,6 +229,8 @@
       state.accountReady = false;
       state.accountKey = '';
       state.files.clear();
+      state.folders.clear();
+      state.folderOptions = defaultFolderOptions();
       state.selected.clear();
       state.lastSyncAt = 0;
       state.syncCheckpoint = null;
@@ -229,6 +245,8 @@
     state.accountKey = key;
     state.accountReady = true;
     state.files.clear();
+    state.folders.clear();
+    state.folderOptions = defaultFolderOptions();
     state.selected.clear();
     window.postMessage({ channel:CHANNEL, type:'CLEAR_PREVIEWS', payload:{} }, location.origin);
     state.previewCache.clear();
@@ -239,7 +257,16 @@
     state.filteredCache.key = '';
 
     const keys = accountKeys();
-    const data = await chrome.storage.local.get([keys.files, keys.sync, keys.checkpoint]);
+    const data = await chrome.storage.local.get([keys.files, keys.sync, keys.checkpoint, keys.folders, keys.folderOptions]);
+    if (state.accountKey !== key) return;
+    for (const folder of data[keys.folders] || []) if (typeof folder.id === 'string') state.folders.set(folder.id, folder);
+    const savedFolders = data[keys.folderOptions] || {};
+    state.folderOptions = {
+      scope: typeof savedFolders.scope === 'string' && /^(all|root|unknown|folder:.+)$/.test(savedFolders.scope) ? savedFolders.scope : 'all',
+      ignoreFolderFiles: savedFolders.ignoreFolderFiles === true,
+      ignoredFolderIds: Array.isArray(savedFolders.ignoredFolderIds) ? savedFolders.ignoredFolderIds.filter(id => typeof id === 'string') : [],
+      includeSubfolders: savedFolders.includeSubfolders !== false
+    };
     for (const raw of data[keys.files] || []) {
       const file = normalizeFile(raw);
       if (isValidFile(file)) state.files.set(file.id, file);
@@ -270,11 +297,30 @@
     state.filteredCache.key = '';
   };
 
+  const defaultFolderOptions = () => ({ scope: 'all', ignoreFolderFiles: false, ignoredFolderIds: [], includeSubfolders: true });
+  const folderAllowed = file => !!file && Folders.allows(file, state.folderOptions, state.folders);
+  const pruneFolderSelection = () => {
+    for (const id of state.selected) if (!state.files.has(id) || !folderAllowed(state.files.get(id))) state.selected.delete(id);
+    if (!state.selected.has(state.lastClickedId)) state.lastClickedId = '';
+  };
+  const folderLabel = file => file.folderKnown !== true ? t('folderUnknown') : !file.folderIds?.length ? t('folderRoot')
+    : file.folderIds.map(id => Folders.path(id, state.folders)).join('; ');
+  const changeFolderOptions = () => {
+    pruneFolderSelection();
+    state.lastClickedId = '';
+    invalidateData();
+    ui.viewport.scrollTop = 0;
+    const keys = accountKeys();
+    if (keys) chrome.storage.local.set({ [keys.folderOptions]: state.folderOptions });
+    updateAll();
+  };
+
   const filteredFiles = () => {
     const key = [state.filesVersion, state.filterVersion, state.query, state.typeFilter, state.sort, state.deletableOnly, state.dateOnly, state.cutoffDate].join('|');
     if (state.filteredCache.key === key) return state.filteredCache.rows;
     const query = state.query.trim().toLocaleLowerCase(currentFormatLocale());
     let rows = [...state.files.values()].filter(file => {
+      if (!folderAllowed(file)) return false;
       if (state.deletableOnly && !hasDeletePair(file)) return false;
       if (state.dateOnly && state.cutoffDate) {
         const cutoff = new Date(`${state.cutoffDate}T00:00:00`).getTime();
@@ -307,6 +353,7 @@
     const cutoff = specifiedDateStartTimestamp();
     if (!cutoff) return [];
     return [...state.files.values()].filter(file => {
+      if (!folderAllowed(file)) return false;
       const ts = timestamp(file.created);
       return !!ts && ts < cutoff;
     });
@@ -331,7 +378,7 @@
     };
   };
 
-  const selectedFiles = () => [...state.selected].map(id => state.files.get(id)).filter(Boolean);
+  const selectedFiles = () => [...state.selected].map(id => state.files.get(id)).filter(file => file && folderAllowed(file));
   const selectedBytes = () => selectedFiles().reduce((sum, file) => sum + (file.size || 0), 0);
 
   const iconSvg = (name, size = 18) => {
@@ -408,6 +455,19 @@
           </header>
           <div class="lc-sync-progress"><span id="lc-sync-bar"></span></div>
 
+          <details class="lc-folder-options" id="lc-folder-options">
+            <summary><span data-i18n="folderOptions"></span><small id="lc-folder-summary"></small></summary>
+            <div class="lc-folder-controls">
+              <label><span data-i18n="folderShow"></span><select id="lc-folder-scope" class="lc-select"></select></label>
+              <label class="lc-check-label"><input type="checkbox" id="lc-ignore-folder-files"><span data-i18n="ignoreFolderFiles"></span></label>
+              <label class="lc-check-label"><input type="checkbox" id="lc-include-subfolders"><span data-i18n="includeSubfolders"></span></label>
+              <button class="lc-text-button" id="lc-reset-folders" data-i18n="resetFolders"></button>
+            </div>
+            <div class="lc-folder-ignore-title" data-i18n="ignoreSelectedFolders"></div>
+            <div class="lc-folder-ignore-list" id="lc-folder-ignore-list"></div>
+            <p class="lc-folder-hint" data-i18n="folderHint"></p>
+          </details>
+
           <main class="lc-content">
             <section class="lc-view lc-files-view" data-view="files">
               <div class="lc-file-toolbar">
@@ -417,6 +477,10 @@
                   <option value="oldest" data-i18n="sortOldest"></option>
                   <option value="name" data-i18n="sortName"></option>
                   <option value="size" data-i18n="sortSize"></option>
+                </select>
+                <select id="lc-view-mode" class="lc-select" data-i18n-aria="viewMode">
+                  <option value="list" data-i18n="viewList"></option>
+                  <option value="grid" data-i18n="viewGrid"></option>
                 </select>
               </div>
               <div class="lc-filterbar">
@@ -499,6 +563,10 @@
       selected: shadow.getElementById('lc-selected'), selectedSize: shadow.getElementById('lc-selected-size'), syncTitle: shadow.getElementById('lc-sync-title'), syncSubtitle: shadow.getElementById('lc-sync-subtitle'),
       sync: shadow.getElementById('lc-sync'), syncBar: shadow.getElementById('lc-sync-bar'), tabs: [...shadow.querySelectorAll('[data-tab]')], views: [...shadow.querySelectorAll('[data-view]')],
       search: shadow.getElementById('lc-search'), searchClear: shadow.getElementById('lc-search-clear'), sort: shadow.getElementById('lc-sort'), types: shadow.getElementById('lc-types'),
+      viewMode: shadow.getElementById('lc-view-mode'), tableShell: shadow.querySelector('.lc-table-shell'),
+      folderOptions: shadow.getElementById('lc-folder-options'), folderSummary: shadow.getElementById('lc-folder-summary'), folderScope: shadow.getElementById('lc-folder-scope'),
+      ignoreFolderFiles: shadow.getElementById('lc-ignore-folder-files'), includeSubfolders: shadow.getElementById('lc-include-subfolders'),
+      folderIgnoreList: shadow.getElementById('lc-folder-ignore-list'), resetFolders: shadow.getElementById('lc-reset-folders'),
       selectAll: shadow.getElementById('lc-select-all'), select100: shadow.getElementById('lc-select-100'), clearSelection: shadow.getElementById('lc-clear-selection'), masterCheck: shadow.getElementById('lc-master-check'),
       viewport: shadow.getElementById('lc-viewport'), spacer: shadow.getElementById('lc-spacer'), rowLayer: shadow.getElementById('lc-row-layer'), empty: shadow.getElementById('lc-empty'),
       cutoff: shadow.getElementById('lc-cutoff'), oldCount: shadow.getElementById('lc-old-count'), oldSize: shadow.getElementById('lc-old-size'), cleanMasterCheck: shadow.getElementById('lc-clean-master-check'), cleanList: shadow.getElementById('lc-clean-list'), cleanEmpty: shadow.getElementById('lc-clean-empty'), cleanCoverage: shadow.getElementById('lc-clean-coverage'), cleanTypes: shadow.getElementById('lc-clean-types'),
@@ -526,6 +594,29 @@
   };
 
   const bindEvents = () => {
+    ui.viewMode.addEventListener('change', event => {
+      state.viewMode = event.target.value === 'grid' ? 'grid' : 'list';
+      ui.viewport.scrollTop = 0;
+      saveUi();
+      updateFileView();
+    });
+    ui.folderScope.addEventListener('change', event => { state.folderOptions.scope = event.target.value; changeFolderOptions(); });
+    ui.ignoreFolderFiles.addEventListener('change', event => { state.folderOptions.ignoreFolderFiles = event.target.checked; changeFolderOptions(); });
+    ui.includeSubfolders.addEventListener('change', event => { state.folderOptions.includeSubfolders = event.target.checked; changeFolderOptions(); });
+    ui.folderIgnoreList.addEventListener('change', event => {
+      const checkbox = event.target.closest('[data-ignore-folder]');
+      if (!checkbox) return;
+      const ids = new Set(state.folderOptions.ignoredFolderIds);
+      checkbox.checked ? ids.add(checkbox.dataset.ignoreFolder) : ids.delete(checkbox.dataset.ignoreFolder);
+      state.folderOptions.ignoredFolderIds = [...ids];
+      changeFolderOptions();
+    });
+    ui.resetFolders.addEventListener('click', () => { state.folderOptions = defaultFolderOptions(); changeFolderOptions(); });
+    ui.resizeObserver = new ResizeObserver(() => renderVirtualRows());
+    ui.resizeObserver.observe(ui.viewport);
+    ui.rowLayer.addEventListener('error', event => {
+      if (event.target.tagName === 'IMG') event.target.closest('.lc-thumb')?.classList.add('is-error');
+    }, true);
     ui.launcher.addEventListener('click', () => { state.panelOpen = true; updatePanelOpen(); setTimeout(renderVirtualRows, 0); });
     ui.close.addEventListener('click', () => { state.panelOpen = false; updatePanelOpen(); });
     ui.theme.addEventListener('click', toggleTheme);
@@ -608,13 +699,16 @@
 
     ui.rowLayer.addEventListener('click', event => {
       const checkbox = event.target.closest('input[type="checkbox"][data-file-id]');
-      if (!checkbox) return;
+      if (!checkbox || checkbox.disabled) return;
       const id = checkbox.dataset.fileId;
+      if (!folderAllowed(state.files.get(id))) return;
       const rows = filteredFiles();
+      let rangeApplied = false;
       if (event.shiftKey && state.lastClickedId) {
         const a = rows.findIndex(file => file.id === state.lastClickedId);
         const b = rows.findIndex(file => file.id === id);
         if (a >= 0 && b >= 0) {
+          rangeApplied = true;
           const [from, to] = a < b ? [a, b] : [b, a];
           const select = checkbox.checked;
           for (const file of rows.slice(from, to + 1)) {
@@ -622,7 +716,8 @@
             if (select) state.selected.add(file.id); else state.selected.delete(file.id);
           }
         }
-      } else {
+      }
+      if (!rangeApplied) {
         if (checkbox.checked) state.selected.add(id); else state.selected.delete(id);
       }
       state.lastClickedId = id;
@@ -652,7 +747,7 @@
       const checkbox = event.target.closest('input[type="checkbox"][data-clean-id]');
       if (!checkbox) return;
       const file = state.files.get(checkbox.dataset.cleanId);
-      if (!file || !hasDeletePair(file)) { checkbox.checked = false; return; }
+      if (!file || !hasDeletePair(file) || !folderAllowed(file)) { checkbox.checked = false; return; }
       if (checkbox.checked) state.selected.add(checkbox.dataset.cleanId); else state.selected.delete(checkbox.dataset.cleanId);
       updateSelectionUi();
       updateCleanView();
@@ -717,6 +812,7 @@
   };
 
   const updateHeader = () => {
+    if (!ui.root) return;
     const total = state.files.size;
     const knownBytes = [...state.files.values()].reduce((sum, file) => sum + (Number(file.size) || 0), 0);
     ui.total.textContent = n(total);
@@ -775,15 +871,36 @@
   };
 
   const updateTypes = () => {
-    const counts = { all: state.files.size, image:0, pdf:0, document:0, spreadsheet:0, presentation:0, archive:0, media:0, other:0 };
-    for (const file of state.files.values()) counts[file.type] = (counts[file.type] || 0) + 1;
+    const counts = { all: 0, image:0, pdf:0, document:0, spreadsheet:0, presentation:0, archive:0, media:0, other:0 };
+    for (const file of state.files.values()) if (folderAllowed(file)) { counts.all++; counts[file.type] = (counts[file.type] || 0) + 1; }
     ui.types.innerHTML = ['all','image','pdf','document','spreadsheet','presentation','archive','media','other'].map(type =>
       `<button class="${state.typeFilter === type ? 'is-active' : ''}" data-type="${type}"><span>${typeLabel(type)}</span><small>${counts[type] || 0}</small></button>`
     ).join('');
   };
 
+  const updateFolderView = () => {
+    const ids = new Set([...state.folders.keys(), ...state.folderOptions.ignoredFolderIds]);
+    for (const file of state.files.values()) for (const id of file.folderIds || []) ids.add(id);
+    if (state.folderOptions.scope.startsWith('folder:')) ids.add(state.folderOptions.scope.slice(7));
+    const sorted = [...ids].sort((a, b) => Folders.path(a, state.folders).localeCompare(Folders.path(b, state.folders), currentFormatLocale(), { numeric: true }));
+    const options = [['all', t('folderAll')], ['root', t('folderRoot')], ['unknown', t('folderUnknown')], ...sorted.map(id => [`folder:${id}`, Folders.path(id, state.folders)])];
+    ui.folderScope.innerHTML = options.map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`).join('');
+    ui.folderScope.value = state.folderOptions.scope;
+    ui.ignoreFolderFiles.checked = state.folderOptions.ignoreFolderFiles;
+    ui.includeSubfolders.checked = state.folderOptions.includeSubfolders;
+    ui.folderIgnoreList.innerHTML = sorted.length ? sorted.map(id => `<label class="lc-check-label" title="${escapeHtml(id)}"><input type="checkbox" data-ignore-folder="${escapeHtml(id)}" ${state.folderOptions.ignoredFolderIds.includes(id) ? 'checked' : ''}><span>${escapeHtml(Folders.path(id, state.folders))}</span></label>`).join('') : `<span class="lc-muted">${t('foldersNotDetected')}</span>`;
+    const unknown = [...state.files.values()].filter(file => file.folderKnown !== true).length;
+    const active = state.folderOptions.scope !== 'all' || state.folderOptions.ignoreFolderFiles || state.folderOptions.ignoredFolderIds.length > 0;
+    ui.folderSummary.textContent = `${active ? t('folderActive') + ' · ' : ''}${t('folderCoverage', { count: n(ids.size), unknown: n(unknown) })}`;
+    // Freeze the rules for an operation already confirmed by the user.
+    for (const input of ui.folderOptions.querySelectorAll('input, select, button')) input.disabled = !state.accountReady || state.deleting;
+  };
+
   const updateFileView = () => {
     ui.sort.value = state.sort;
+    ui.viewMode.value = state.viewMode;
+    ui.tableShell.classList.toggle('is-grid', state.viewMode === 'grid');
+    ui.tableShell.querySelector('.lc-table-head > :nth-child(2)').textContent = t(state.viewMode === 'grid' ? 'gridOrder' : 'name');
     if (ui.search.value !== state.query && ui.shadow.activeElement !== ui.search) ui.search.value = state.query;
     updateTypes();
     const rows = filteredFiles();
@@ -799,12 +916,20 @@
   const renderVirtualRows = () => {
     if (!ui.viewport || state.activeTab !== 'files') return;
     const rows = filteredFiles();
+    const grid = state.viewMode === 'grid';
+    const availableWidth = Math.max(1, ui.viewport.clientWidth - GRID_GAP * 2);
+    const columns = grid ? Math.max(1, Math.floor((availableWidth + GRID_GAP) / (GRID_MIN_WIDTH + GRID_GAP))) : 1;
+    const cardWidth = (availableWidth - GRID_GAP * (columns - 1)) / columns;
+    const rowHeight = grid ? GRID_HEIGHT + GRID_GAP : ROW_HEIGHT;
+    const overscan = grid ? 2 : OVERSCAN;
     const viewportHeight = ui.viewport.clientHeight || 420;
+    const totalHeight = Math.max(1, Math.ceil(rows.length / columns) * rowHeight + (grid ? GRID_GAP : 0));
+    ui.spacer.style.height = `${totalHeight}px`;
+    ui.viewport.scrollTop = Math.min(ui.viewport.scrollTop, Math.max(0, totalHeight - viewportHeight));
     const scrollTop = ui.viewport.scrollTop;
-    const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
-    const visibleCount = Math.ceil(viewportHeight / ROW_HEIGHT) + OVERSCAN * 2;
+    const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan) * columns;
+    const visibleCount = (Math.ceil(viewportHeight / rowHeight) + overscan * 2) * columns;
     const end = Math.min(rows.length, start + visibleCount);
-    ui.spacer.style.height = `${Math.max(1, rows.length * ROW_HEIGHT)}px`;
 
     const html = [];
     for (let i = start; i < end; i++) {
@@ -813,12 +938,25 @@
       const preview = state.previewCache.get(file.id) || file.thumbnailUrl || '';
       if (file.type === 'image' && !preview && file.fileId) queuePreview(file);
       const visual = preview
-        ? `<div class="lc-thumb"><img src="${escapeHtml(preview)}" alt="" loading="lazy" decoding="async" onerror="this.closest('.lc-thumb').classList.add('is-error')"><div class="lc-thumb-fallback">${fileGlyph(file)}</div></div>`
+        ? `<div class="lc-thumb"><img src="${escapeHtml(preview)}" alt="" loading="lazy" decoding="async"><div class="lc-thumb-fallback">${fileGlyph(file)}</div></div>`
         : fileGlyph(file);
+      const checkbox = `<input type="checkbox" data-file-id="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)}" ${selected ? 'checked' : ''} ${hasDeletePair(file) ? '' : `disabled title="${escapeHtml(t('missingDeleteInfo'))}"`}>`;
+      if (grid) {
+        const x = GRID_GAP + (i % columns) * (cardWidth + GRID_GAP);
+        const y = GRID_GAP + Math.floor(i / columns) * rowHeight;
+        html.push(`<label class="lc-card ${selected ? 'is-selected' : ''} ${hasDeletePair(file) ? '' : 'is-disabled'}" data-row-id="${escapeHtml(file.id)}" style="width:${cardWidth}px;height:${GRID_HEIGHT}px;transform:translate(${x}px,${y}px)">
+          <span class="lc-card-check">${checkbox}<span>${escapeHtml(typeLabel(file.type))}</span></span>
+          <span class="lc-card-visual">${visual}</span>
+          <strong class="lc-card-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong>
+          <span class="lc-card-folder" title="${escapeHtml(folderLabel(file))}">${escapeHtml(folderLabel(file))}</span>
+          <span class="lc-card-meta"><span>${fmtDate(file.created)}</span><span>${fmtBytes(file.size)}</span></span>
+        </label>`);
+        continue;
+      }
       html.push(`
         <div class="lc-row ${selected ? 'is-selected' : ''}" data-row-id="${escapeHtml(file.id)}" style="transform:translateY(${i * ROW_HEIGHT}px)">
-          <div class="lc-cell lc-cell-check"><input type="checkbox" data-file-id="${escapeHtml(file.id)}" ${selected ? 'checked' : ''} ${hasDeletePair(file) ? '' : `disabled title="${escapeHtml(t('missingDeleteInfo'))}"`}></div>
-          <div class="lc-cell lc-name-cell">${visual}<div class="lc-file-copy"><strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong><span>${escapeHtml(file.mime || typeLabel(file.type))}</span></div></div>
+          <div class="lc-cell lc-cell-check">${checkbox}</div>
+          <div class="lc-cell lc-name-cell">${visual}<div class="lc-file-copy"><strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong><span title="${escapeHtml(folderLabel(file))}">${escapeHtml(folderLabel(file))} · ${escapeHtml(file.mime || typeLabel(file.type))}</span></div></div>
           <div class="lc-cell"><span class="lc-kind">${typeLabel(file.type)}</span></div>
           <div class="lc-cell lc-muted">${file.ext ? `.${escapeHtml(file.ext)}` : '—'}</div>
           <div class="lc-cell lc-muted">${fmtDate(file.created)}</div>
@@ -826,7 +964,9 @@
         </div>
       `);
     }
+    const focusedId = ui.shadow.activeElement?.dataset?.fileId;
     ui.rowLayer.innerHTML = html.join('');
+    if (focusedId) [...ui.rowLayer.querySelectorAll('[data-file-id]')].find(el => el.dataset.fileId === focusedId)?.focus({ preventScroll: true });
   };
 
   const queuePreview = file => {
@@ -863,6 +1003,7 @@
   const previewResolvers = new Map();
 
   const updateSelectionUi = () => {
+    pruneFolderSelection();
     const count = state.selected.size;
     const bytes = selectedBytes();
     ui.selected.textContent = n(count);
@@ -987,6 +1128,7 @@
   };
 
   const updateSettings = () => {
+    if (!ui.root) return;
     ui.language.value = state.language;
     ui.themeSettings.value = state.theme;
     ui.concurrency.value = String(state.concurrency);
@@ -1003,6 +1145,7 @@
     updatePanelOpen();
     updateHeader();
     updateTabs();
+    updateFolderView();
     updateFileView();
     updateSelectionUi();
     updateCleanView();
@@ -1015,6 +1158,8 @@
     state.syncUiTimer = setTimeout(() => {
       state.syncUiTimer = null;
       updateHeader();
+      updateFolderView();
+      updateSelectionUi();
       if (state.panelOpen && state.activeTab === 'files') updateFileView();
       else if (state.panelOpen && state.activeTab === 'clean') updateCleanView();
       updateSettings();
@@ -1039,7 +1184,7 @@
       requestId:state.syncRequestId,
       knownIds:[...state.files.keys()],
       resumeCheckpoint:state.syncCheckpoint,
-      incremental:state.files.size > 0 && !state.syncCheckpoint
+      incremental:!!automatic && state.files.size > 0 && !state.syncCheckpoint
     } }, location.origin);
   };
   const stopSync = () => {
@@ -1075,11 +1220,13 @@
       if (previous.thumbnailUrl && !incoming.thumbnailUrl) mergedRaw.thumbnailUrl = previous.thumbnailUrl;
       if (previous.fileId && !incoming.fileId) mergedRaw.fileId = previous.fileId;
       if (previous.libraryFileId && !incoming.libraryFileId) mergedRaw.libraryFileId = previous.libraryFileId;
+      Object.assign(mergedRaw, Folders.mergeMembership(previous, incoming));
       const merged = normalizeFile(mergedRaw);
       state.files.set(merged.id, merged);
       changed = true;
     }
     if (changed) {
+      pruneFolderSelection();
       invalidateData();
       scheduleIndexSave();
       scheduleSyncUi();
@@ -1095,23 +1242,33 @@
   const resultResolvers = new Map();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-  const deleteChunkWithRetry = async files => {
+  const deleteChunkWithRetry = async (files, accountKey) => {
     let delay = 800;
     let last = { ok:false, status:0, error:'unknown' };
+    const skippedIds = new Set();
     for (let attempt = 0; attempt < 5; attempt++) {
+      // Recheck before every request, including retries and split batches.
+      files = files.filter(file => {
+        const allowed = state.accountKey === accountKey && folderAllowed(state.files.get(file.id));
+        if (!allowed) skippedIds.add(file.id);
+        return allowed;
+      });
+      if (!files.length) return { ok:true, deletedIds:[], failedIds:[], skippedIds:[...skippedIds] };
       last = await requestResult('DELETE_BATCH', { files }, 'DELETE_RESULT');
-      if (last.ok) return last;
+      if (last.ok) return { ...last, deletedIds:files.map(file => file.id), failedIds:[], skippedIds:[...skippedIds] };
       if ([400,413,422].includes(last.status) && files.length > 1) {
         const mid = Math.ceil(files.length / 2);
-        const a = await deleteChunkWithRetry(files.slice(0, mid));
-        const b = await deleteChunkWithRetry(files.slice(mid));
-        return { ok:a.ok && b.ok, status: a.ok ? b.status : a.status, split:true };
+        const a = await deleteChunkWithRetry(files.slice(0, mid), accountKey);
+        const b = await deleteChunkWithRetry(files.slice(mid), accountKey);
+        return { ok:a.ok && b.ok, status:a.ok ? b.status : a.status, error:a.error || b.error,
+          deletedIds:[...a.deletedIds, ...b.deletedIds], failedIds:[...a.failedIds, ...b.failedIds],
+          skippedIds:[...skippedIds, ...a.skippedIds, ...b.skippedIds] };
       }
-      if (![0,408,409,425,429,500,502,503,504].includes(last.status)) return last;
+      if (![0,408,409,425,429,500,502,503,504].includes(last.status)) break;
       await sleep(delay + Math.random() * 300);
       delay = Math.min(delay * 2, 7000);
     }
-    return last;
+    return { ...last, deletedIds:[], failedIds:files.map(file => file.id), skippedIds:[...skippedIds] };
   };
 
   const bulkDelete = async () => {
@@ -1127,29 +1284,33 @@
     ].filter((part, index) => part || index === 2).join('\n');
     if (!confirm(prompt)) return;
 
+    const accountKey = state.accountKey;
     state.deleting = true;
     state.deleteProgress = { total: files.length, done:0, failed:0 };
     updateSelectionUi();
+    updateFolderView();
 
     const chunkSize = state.concurrency === 1 ? 5 : state.concurrency === 2 ? 10 : 20;
     const chunks = [];
     for (let i = 0; i < files.length; i += chunkSize) chunks.push(files.slice(i, i + chunkSize));
     let cursor = 0;
     const failed = [];
+    let deletedCount = 0, skippedCount = 0;
     const failureCodes = new Map();
     const workers = Array.from({ length: Math.min(state.concurrency, chunks.length) }, async () => {
       while (true) {
         const index = cursor++;
         if (index >= chunks.length) return;
         const chunk = chunks[index];
-        const result = await deleteChunkWithRetry(chunk);
-        if (result.ok) {
-          for (const file of chunk) { state.files.delete(file.id); state.selected.delete(file.id); }
-        } else {
-          failed.push(...chunk);
+        const result = await deleteChunkWithRetry(chunk, accountKey);
+        deletedCount += result.deletedIds.length;
+        skippedCount += result.skippedIds.length;
+        if (state.accountKey === accountKey) for (const id of result.deletedIds) { state.files.delete(id); state.selected.delete(id); }
+        if (result.failedIds.length) {
+          failed.push(...result.failedIds);
           const code = result.status ? `HTTP ${result.status}` : (result.error || t('unknownError'));
-          failureCodes.set(code, (failureCodes.get(code)||0) + chunk.length);
-          state.deleteProgress.failed += chunk.length;
+          failureCodes.set(code, (failureCodes.get(code)||0) + result.failedIds.length);
+          state.deleteProgress.failed += result.failedIds.length;
         }
         state.deleteProgress.done += chunk.length;
         invalidateData();
@@ -1161,13 +1322,13 @@
     });
     await Promise.all(workers);
     state.deleting = false;
-    state.lastSyncAt = Date.now();
-    await saveIndex();
+    if (state.accountKey === accountKey) { state.lastSyncAt = Date.now(); await saveIndex(); }
     updateAll();
     const failureSummary = [...failureCodes.entries()].map(([code,count]) => `${bridgeText(code)} × ${n(count)}`).join(' · ');
-    alert(failed.length
+    const summary = failed.length
       ? [t('deletePartial', { count:t('failedFiles', { count:n(failed.length) }) }), failureSummary, t('deleteRetry')].filter(Boolean).join('\n')
-      : t('deleteSuccess', { count:t('deletedFiles', { count:n(files.length) }) }));
+      : t('deleteSuccess', { count:t('deletedFiles', { count:n(deletedCount) }) });
+    alert([summary, skippedCount ? t('folderSkipped', { count:n(skippedCount) }) : ''].filter(Boolean).join('\n'));
   };
 
   const startBackup = () => {
@@ -1191,11 +1352,12 @@
     if (!confirm(`${t('confirmClearIndex')}\n${t('clearIndexWarning')}`)) return;
     const keys = accountKeys();
     state.files.clear();
+    state.folders.clear();
     state.selected.clear();
     state.lastSyncAt = 0;
     state.syncCheckpoint = null;
     invalidateData();
-    if (keys) await chrome.storage.local.remove([keys.files, keys.sync, keys.checkpoint]);
+    if (keys) await chrome.storage.local.remove([keys.files, keys.folders, keys.sync, keys.checkpoint]);
     updateAll();
     startSync(false);
   };
@@ -1207,6 +1369,19 @@
     if (msg.type === 'BRIDGE_READY') { state.bridgeReady = true; updateHeader(); updateSettings(); return; }
     if (msg.type === 'LIBRARY_SOURCE_READY') { state.librarySource = { method: msg.payload?.method || '', url: msg.payload?.url || '', count: msg.payload?.count || 0 }; updateSettings(); return; }
     if (msg.type === 'ACCOUNT_CONTEXT') { switchAccount(msg.payload?.identifier); return; }
+    if (msg.type === 'OBSERVED_FILES' && state.accountReady) { mergeSyncBatch(msg.payload?.files); return; }
+    if (msg.type === 'FOLDER_METADATA' && state.accountReady) {
+      for (const folder of msg.payload?.folders || []) {
+        if (typeof folder.id !== 'string') continue;
+        const previous = state.folders.get(folder.id);
+        state.folders.set(folder.id, { ...previous, ...folder, ...(!folder.parentKnown && previous?.parentKnown ? { parentId: previous.parentId, parentKnown: true } : {}) });
+      }
+      pruneFolderSelection();
+      invalidateData();
+      scheduleIndexSave();
+      scheduleSyncUi();
+      return;
+    }
     if (msg.type === 'SYNC_BATCH' && msg.payload?.requestId === state.syncRequestId) { mergeSyncBatch(msg.payload.files); return; }
     if (msg.type === 'SYNC_PROGRESS' && msg.payload?.requestId === state.syncRequestId) {
       state.syncProgress = { ...(state.syncProgress || {}), ...msg.payload };
