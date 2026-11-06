@@ -3,6 +3,7 @@
   window.__LC_PAGE_BRIDGE_V220__ = true;
 
   const CHANNEL = 'LC_BRIDGE_V240';
+  const Folders = globalThis.LibraryCleanerFolders;
   const post = (type, payload = {}) => window.postMessage({ channel: CHANNEL, type, payload }, location.origin);
   const originalFetch = window.fetch.bind(window);
   const syncControllers = new Map();
@@ -169,6 +170,7 @@
 
   const extractCandidate = node => {
     if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
+    if (Folders.isFolder(node)) return null;
     const rawId = deepValue(node, ['id','library_file_id','libraryFileId','file_id','fileId']);
     const libraryFileId = libId(deepValue(node, ['library_file_id','libraryFileId'])) || libId(node.id);
     const nestedFileId = deepValue(node, ['file_id','fileId']);
@@ -196,19 +198,10 @@
     };
   };
 
-  const extractCandidates = (node, out = [], depth = 0) => {
-    if (depth > 10 || node == null) return out;
-    if (Array.isArray(node)) {
-      for (const item of node) extractCandidates(item, out, depth + 1);
-      return out;
-    }
-    if (typeof node !== 'object') return out;
-    const candidate = extractCandidate(node);
-    if (candidate) out.push(candidate);
-    for (const value of Object.values(node)) {
-      if (value && typeof value === 'object') extractCandidates(value, out, depth + 1);
-    }
-    return out;
+  const extractCandidates = (node, url = '', body = null) => {
+    const result = Folders.scan(node, extractCandidate, Folders.requestMembership(url, body));
+    if (result.folders.length) post('FOLDER_METADATA', { folders: result.folders });
+    return result.files;
   };
 
   const mergeCandidate = (base = {}, incoming = {}) => {
@@ -223,6 +216,7 @@
     if (base.thumbnailUrl && !incoming.thumbnailUrl) out.thumbnailUrl = base.thumbnailUrl;
     if (base.libraryFileId && !incoming.libraryFileId) out.libraryFileId = base.libraryFileId;
     if (base.fileId && !incoming.fileId) out.fileId = base.fileId;
+    Object.assign(out, Folders.mergeMembership(base, incoming));
     return out;
   };
   const uniqueCandidates = list => {
@@ -385,9 +379,12 @@
   const openLibrarySource = async signal => {
     for (let i = 0; i < 8 && !learnedLibrarySource && !signal?.aborted; i++) await sleep(100);
 
-    if (learnedLibrarySource && learnedLibraryFirstPage?.json && learnedLibraryFirstPage?.candidates?.length) {
-      post('LIBRARY_SOURCE_READY', { method: learnedLibrarySource.method, url: learnedLibrarySource.url, count: learnedLibraryFirstPage.candidates.length });
-      return { ...learnedLibrarySource, json: learnedLibraryFirstPage.json, candidates: learnedLibraryFirstPage.candidates };
+    if (learnedLibrarySource && learnedLibraryFirstPage?.json) {
+      const json = learnedLibraryFirstPage.json;
+      learnedLibraryFirstPage = null;
+      const candidates = uniqueCandidates(extractCandidates(json, learnedLibrarySource.url, learnedLibrarySource.body));
+      post('LIBRARY_SOURCE_READY', { method: learnedLibrarySource.method, url: learnedLibrarySource.url, count: candidates.length });
+      return { ...learnedLibrarySource, json, candidates };
     }
 
     const sources = [];
@@ -410,8 +407,7 @@
         if (!response.ok) continue;
         const json = safeJson(await response.text());
         if (!json) continue;
-        const candidates = uniqueCandidates(extractCandidates(json));
-        if (!candidates.length) continue;
+        const candidates = uniqueCandidates(extractCandidates(json, source.url, source.body));
         const normalized = normalizeLibrarySource(source.url, source.method, source.headers, source.body);
         const page = paginationInfo(json, normalized.url, candidates.length);
         const paginates = (page.nextCursor != null && String(page.nextCursor) !== '') || page.hasMore === true || page.next || page.offset != null || page.page != null || (page.total != null && page.total > candidates.length);
@@ -484,7 +480,7 @@
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           json = safeJson(await response.text());
           if (!json) throw new Error('LCERR_SYNC_JSON');
-          candidates = uniqueCandidates(extractCandidates(json));
+          candidates = uniqueCandidates(extractCandidates(json, url, body));
         }
 
         let newOnPage = 0;
@@ -509,9 +505,10 @@
           : null;
         emitProgress({ pageItems: candidates.length, newOnPage, unknownOnPage, total: page.total, hasMore: page.hasMore, sourceUrl: url, sourceMethod: method, checkpoint });
 
-        if (!candidates.length || page.hasMore === false) break;
-        noNewStreak = newOnPage === 0 ? noNewStreak + 1 : 0;
-        noUnknownStreak = unknownOnPage === 0 ? noUnknownStreak + 1 : 0;
+        if (page.hasMore === false) break;
+        // A nodes page may contain only directories and still have another page.
+        noNewStreak = candidates.length && newOnPage === 0 ? noNewStreak + 1 : 0;
+        noUnknownStreak = candidates.length && unknownOnPage === 0 ? noUnknownStreak + 1 : 0;
         if (noNewStreak >= 2) break;
         if (incremental && noUnknownStreak >= 2) break;
         if (method === 'GET') {
@@ -819,6 +816,18 @@
     } finally { backupControllers.delete(requestId); }
   };
 
+  const observeLibraryResponse = (json, url, method, headers, body) => {
+    const candidates = uniqueCandidates(extractCandidates(json, url, body));
+    if (candidates.length) post('OBSERVED_FILES', { files: candidates });
+    // Folder navigation can enrich the index, but must not replace the full-library source.
+    const scoped = Folders.requestMembership(url, body).folderKnown;
+    if (scoped || (learnedLibrarySource && Date.now() >= discoveryUntil)) return;
+    const source = normalizeLibrarySource(url, method, headers, body);
+    learnedLibrarySource = source;
+    learnedLibraryFirstPage = source.url === new URL(url, location.href).href && source.body === body ? { json, candidates } : null;
+    post('LIBRARY_SOURCE_READY', { method, url: source.url, count: candidates.length });
+  };
+
   window.fetch = async function(input, init = {}) {
     const req = input instanceof Request ? input : null;
     const url = req ? req.url : String(input);
@@ -828,20 +837,18 @@
       try { new Headers(init.headers || (req && req.headers) || {}).forEach((v,k)=>headers[k]=v); } catch {}
       learnedDeleteHeaders = cleanHeaders(headers);
     }
+    const requestCopy = req && method === 'POST' && isLibraryRequest(url) ? req.clone() : null;
     const response = await originalFetch(input, init);
-    if ((!learnedLibrarySource || Date.now() < discoveryUntil) && isLibraryRequest(url) && ['GET','POST'].includes(method)) {
+    if (response.ok && isLibraryRequest(url) && ['GET','POST'].includes(method)) {
       try {
         const clone = response.clone();
         const json = safeJson(await clone.text());
-        const candidates = json ? uniqueCandidates(extractCandidates(json)) : [];
-        if (candidates.length) {
+        if (json) {
           let body = init.body;
-          if (body == null && req && method === 'POST') { try { body = await req.clone().text(); } catch {} }
+          if (body == null && requestCopy) { try { body = await requestCopy.text(); } catch {} }
           const headers = {};
           try { new Headers(init.headers || (req && req.headers) || {}).forEach((v,k)=>headers[k]=v); } catch {}
-          learnedLibrarySource = normalizeLibrarySource(url, method, headers, typeof body === 'string' ? body : null);
-          learnedLibraryFirstPage = { json, candidates };
-          post('LIBRARY_SOURCE_READY', { method, url: learnedLibrarySource.url, count:candidates.length });
+          observeLibraryResponse(json, url, method, headers, typeof body === 'string' ? body : null);
         }
       } catch {}
     }
@@ -869,18 +876,14 @@
   };
   XMLHttpRequest.prototype.send = function(body) {
     const meta = this.__lcLibraryMeta;
-    if (meta && isLibraryRequest(meta.url) && ['GET','POST'].includes(meta.method) && (!learnedLibrarySource || Date.now() < discoveryUntil)) {
+    if (meta && isLibraryRequest(meta.url) && ['GET','POST'].includes(meta.method)) {
       this.addEventListener('loadend', () => {
         try {
           if (this.status < 200 || this.status >= 300 || typeof this.responseText !== 'string') return;
           const json = safeJson(this.responseText);
           if (!json) return;
-          const candidates = uniqueCandidates(extractCandidates(json));
-          if (!candidates.length) return;
           const bodyText = typeof body === 'string' ? body : null;
-          learnedLibrarySource = normalizeLibrarySource(meta.url, meta.method, meta.headers, bodyText);
-          learnedLibraryFirstPage = { json, candidates };
-          post('LIBRARY_SOURCE_READY', { method: meta.method, url: learnedLibrarySource.url, count: candidates.length });
+          observeLibraryResponse(json, meta.url, meta.method, meta.headers, bodyText);
         } catch {}
       }, { once:true });
     }

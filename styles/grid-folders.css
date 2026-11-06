@@ -1,0 +1,43 @@
+.lc-file-toolbar { grid-template-columns:minmax(0,1fr) 190px 140px; }
+.lc-folder-options { flex:0 0 auto; border-bottom:1px solid var(--border); background:var(--panel-2); max-height:42%; overflow:auto; }
+.lc-folder-options summary { padding:10px 20px; cursor:pointer; color:var(--text); font-weight:600; }
+.lc-folder-options summary small { margin-left:12px; color:var(--muted); font-weight:400; }
+.lc-folder-controls { display:flex; flex-wrap:wrap; align-items:center; gap:10px 16px; padding:0 20px 10px; }
+.lc-folder-controls > label:first-child { display:flex; align-items:center; gap:8px; min-width:0; }
+.lc-folder-controls .lc-select { max-width:320px; height:36px; }
+.lc-folder-ignore-title { padding:0 20px 6px; font-size:12px; font-weight:600; }
+.lc-folder-ignore-list { display:flex; flex-wrap:wrap; gap:8px 18px; max-height:96px; overflow:auto; padding:0 20px 8px; }
+.lc-folder-ignore-list label { max-width:100%; min-width:0; }
+.lc-folder-ignore-list label span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.lc-folder-options input { accent-color:var(--accent); flex-shrink:0; }
+.lc-folder-hint { margin:0; padding:0 20px 10px; font-size:12px; line-height:1.5; color:var(--muted); }
+.lc-table-shell.is-grid .lc-table-head { grid-template-columns:36px minmax(0,1fr); }
+.lc-table-shell.is-grid .lc-table-head > :nth-child(n+3) { display:none; }
+.lc-card { position:absolute; left:0; top:0; display:flex; flex-direction:column; padding:10px; gap:5px; border:1px solid var(--border-strong); border-radius:10px; background:var(--panel); cursor:pointer; user-select:none; overflow:hidden; }
+.lc-card:hover { background:var(--row-hover); border-color:var(--accent); }
+.lc-card.is-selected { background:var(--selected); border-color:var(--accent); }
+.lc-card:focus-within { outline:2px solid var(--accent); outline-offset:1px; }
+.lc-card.is-disabled { opacity:.6; cursor:default; }
+.lc-card-check { display:flex; align-items:center; gap:7px; height:18px; flex:0 0 18px; color:var(--muted); font-size:11px; }
+.lc-card-check input { width:16px; height:16px; margin:0; accent-color:var(--accent); }
+.lc-card-visual { display:flex; justify-content:center; align-items:center; height:132px; flex:0 0 132px; min-width:0; }
+.lc-card-visual .lc-thumb, .lc-card-visual > .lc-file-glyph { width:100%; height:100%; flex:1 1 auto; }
+.lc-card-visual .lc-thumb img { object-fit:contain; }
+.lc-card-visual > .lc-file-glyph svg { width:44px; height:44px; }
+.lc-card-visual > .lc-file-glyph span { font-size:13px; }
+.lc-card-visual .lc-thumb-fallback .lc-file-glyph { width:100%; height:100%; }
+.lc-card-name, .lc-card-folder { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:18px; }
+.lc-card-name { font-size:13px; }
+.lc-card-folder { color:var(--muted); font-size:11px; }
+.lc-card-meta { display:flex; justify-content:space-between; gap:6px; color:var(--muted); font-size:11px; line-height:16px; }
+@media (max-width:900px) {
+  .lc-file-toolbar { grid-template-columns:minmax(0,1fr) 130px; }
+  .lc-file-toolbar .lc-search-wrap { grid-column:1 / -1; }
+}
+@media (max-width:590px) {
+  .lc-folder-options summary { padding:8px 12px; }
+  .lc-folder-options summary small { display:block; margin:4px 0 0 14px; }
+  .lc-folder-controls { padding:0 12px 8px; }
+  .lc-folder-controls > label:first-child { width:100%; }
+  .lc-folder-controls .lc-select { flex:1; min-width:0; max-width:100%; }
+}
