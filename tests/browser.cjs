@@ -49,7 +49,7 @@ const currentIds = () => page.locator('[data-row-id]').evaluateAll(nodes => node
       if (url.protocol === 'chrome-extension:') return route.continue();
       if (url.origin !== 'https://chatgpt.com') return route.abort();
       if (url.pathname === '/backend-api/me') return route.fulfill({ json: { id: account } });
-      if (url.pathname === '/library') return route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Cleaner fixture</title><h1>Local fixture — no real account</h1>' });
+      if (url.pathname === '/library') return route.fulfill({ contentType: 'text/html; charset=utf-8', body: '<!doctype html><meta charset="utf-8"><title>Cleaner fixture</title><h1>Local fixture — no real account</h1>' });
       if (url.pathname === '/backend-api/files/library/nodes') {
         if (url.searchParams.has('directory_id')) return route.fulfill({ json: { nodes: [file(301, { directory_id: 'folder-project' })], has_more: false } });
         if (mode === 'pagination') {
@@ -75,6 +75,7 @@ const currentIds = () => page.locator('[data-row-id]').evaluateAll(nodes => node
     page.on('dialog', async dialog => { alerts.push(dialog.message()); await dialog.accept(); });
     await page.goto('https://chatgpt.com/library');
     await page.locator('#lc-launcher').click();
+    await page.waitForFunction(() => document.querySelector('#lc-extension-host')?.shadowRoot?.querySelector('.lc-version-badge')?.textContent === 'v2.12.0-test.1');
     await page.waitForFunction(() => window.__LC_PAGE_BRIDGE_V220__ === true);
     await page.waitForFunction(() => document.querySelector('#lc-extension-host')?.shadowRoot?.querySelector('#lc-status')?.dataset.state === 'ready');
     await page.evaluate(() => fetch('/backend-api/files/library/nodes').then(r => r.json()));
@@ -165,15 +166,19 @@ const currentIds = () => page.locator('[data-row-id]').evaluateAll(nodes => node
     await page.locator('#lc-reset-folders').click();
 
     // Resize and both themes: no horizontal spill or variable tile heights.
+    await page.screenshot({ path: path.join(out, 'folders-light.png'), animations: 'disabled' });
     await page.locator('#lc-folder-options > summary').click();
-    await page.screenshot({ path: path.join(out, 'grid-light.png') });
+    await page.screenshot({ path: path.join(out, 'grid-light.png'), animations: 'disabled' });
     await page.locator('#lc-theme').click();
-    await page.screenshot({ path: path.join(out, 'grid-dark.png') });
+    await page.screenshot({ path: path.join(out, 'grid-dark.png'), animations: 'disabled' });
+    await page.locator('#lc-folder-options > summary').click();
+    await page.screenshot({ path: path.join(out, 'folders-dark.png'), animations: 'disabled' });
+    await page.locator('#lc-folder-options > summary').click();
     await page.setViewportSize({ width: 700, height: 800 });
     await page.waitForTimeout(150);
     const geometry = await page.locator('#lc-viewport').evaluate(el => ({ width: el.clientWidth, scroll: el.scrollWidth }));
     assert.ok(geometry.scroll <= geometry.width + 1);
-    await page.screenshot({ path: path.join(out, 'grid-narrow.png') });
+    await page.screenshot({ path: path.join(out, 'grid-narrow.png'), animations: 'disabled' });
     await page.setViewportSize({ width: 1440, height: 1000 });
 
     // Separate account gets its own folder index and settings.

@@ -39,4 +39,4 @@ Folder extraction is tested against explicit fixtures, not a captured payload fr
 
 An absent field is **Unknown folder**. Explicit null/empty ID arrays mean **No folder**. If ignored-folder protection is active, unknown membership is not selectable; when ignoring descendants, an unresolved ancestor chain is protected too. Cached metadata can become stale if files move elsewhere; use manual Sync before relying on a folder rule. Different ChatGPT API variants may need an adapter update.
 
-The local execution environment used for this change blocks Chromium process sockets and disallows permission escalation. Local verification therefore uses simulated DOM; the browser suite is provided for GitHub Actions and normal development machines. Consult the workflow result for whether the browser checks passed on the published commit.
+The browser suite runs on GitHub Actions and normal development machines. The `browser-test-results` workflow artifact includes light/dark grid and folder-panel screenshots plus a narrower layout. Consult the workflow result for the status of the published commit. These checks validate generated fixtures, not live account data.
